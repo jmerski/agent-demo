@@ -14,7 +14,7 @@ except ImportError:
 
 # --- Configuration ---
 MODEL_NAME = "qwen2.5-coder:3b"
-MAX_STEPS_PER_TURN = 30          # Increased to allow reading multiple files before moving
+MAX_STEPS_PER_TURN = 30          
 SUBPROC_TIMEOUT = 15
 WORKSPACE_ROOT = Path.cwd().resolve()
 MAX_READ_BYTES = 200_000         
@@ -44,7 +44,7 @@ def is_binary(path: Path) -> bool:
     except OSError:
         return False
 
-# --- Strict System Prompt ---
+# --- Updated, Balanced System Prompt ---
 SYSTEM_PROMPT = f"""You are a strict, literal software engineering and FILE ORGANIZATION agent.
 
 WORKSPACE ROOT: {WORKSPACE_ROOT}
@@ -55,13 +55,13 @@ OPERATING RULES:
 2. ONLY emit plain prose when the task is fully complete.
 3. If you need to edit an existing file, you MUST call read_file first.
 4. When using write_file, you MUST output the ENTIRE file content.
-5. To ORGANIZE files by topic: 
+5. To CREATE files: Use write_file directly to generate the requested content.
+6. To ORGANIZE EXISTING files by topic: 
    a. Call list_files(recursive=true).
-   b. Call read_file on EVERY file to understand its contents. DO NOT guess topics based on file extensions.
-   c. Determine logical topics based on what you read.
-   d. Call create_folder for each topic (e.g. "Invoices", "React_Components").
-   e. Call move_file to relocate each file into its correct folder.
-6. You can output multiple tool calls in a single response if they do not depend on each other.
+   b. Call read_file ONLY on files you need to inspect to determine their topic.
+   c. Call create_folder for each topic (e.g. "Invoices", "React_Components").
+   d. Call move_file to relocate each file into its correct folder.
+7. You can output multiple tool calls in a single response if they do not depend on each other.
 
 AVAILABLE TOOLS:
 - list_files(path=".", recursive=false) -> str
@@ -76,7 +76,7 @@ AVAILABLE TOOLS:
 CORRECT INVOCATION EXAMPLE:
 {{"name": "create_folder", "arguments": {{"path": "Reports/2024/Q1"}}}}
 
-Begin by listing files (recursive=true) if unsure of the workspace state.
+Begin by listing files (recursive=true) if unsure of the workspace state, or start creating files if requested.
 """
 
 # --- Tool Schema ---
@@ -98,11 +98,11 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
     }},
     {"type": "function", "function": {
-        "name": "move_file", "description": "Move or rename a file/directory.",
+        "name": "move_file", "description": "Move or rename a file/directory. If destination is an existing directory, the file is moved inside it.",
         "parameters": {"type": "object", "properties": {"source": {"type": "string"}, "destination": {"type": "string"}, "overwrite": {"type": "boolean", "default": False}}, "required": ["source", "destination"]}
     }},
     {"type": "function", "function": {
-        "name": "copy_file", "description": "Copy a file to a new path.",
+        "name": "copy_file", "description": "Copy a file to a new path. If destination is an existing directory, the file is copied inside it.",
         "parameters": {"type": "object", "properties": {"source": {"type": "string"}, "destination": {"type": "string"}}, "required": ["source", "destination"]}
     }},
     {"type": "function", "function": {
@@ -122,7 +122,6 @@ def extract_tool_calls_from_text(content: str, user_prompt: str = "") -> list:
         return []
 
     def find_json_objects(s: str):
-        """Yields valid JSON strings by tracking bracket depth, ignoring strings."""
         objs = []
         start_idx = -1
         depth = 0
@@ -162,7 +161,6 @@ def extract_tool_calls_from_text(content: str, user_prompt: str = "") -> list:
                         args = json.loads(args)
                     except: 
                         args = {}
-                # Fix syntax error was here
                 if not isinstance(args, dict): 
                     args = {}
                 parsed_calls.append({"function": {"name": data["name"], "arguments": args}})
@@ -173,12 +171,12 @@ def extract_tool_calls_from_text(content: str, user_prompt: str = "") -> list:
         return parsed_calls
 
     # Fallback 2: Markdown code block interceptor
-    code_block_pattern = re.compile(r"```(?:html|python|py|js|javascript|css|json|txt)?\s*\n(.*?)\n```", re.DOTALL)
+    code_block_pattern = re.compile(r"```(?:html|python|py|js|javascript|css|json|txt|csv)?\s*\n(.*?)\n```", re.DOTALL)
     code_matches = code_block_pattern.findall(content)
     if code_matches:
         code = code_matches[0]
-        fn_match = re.search(r'([a-zA-Z0-9_\-]+\.(html|py|js|css|txt|json))', user_prompt, re.IGNORECASE)
-        filename = fn_match.group(1) if fn_match else "intercepted_code.html"
+        fn_match = re.search(r'([a-zA-Z0-9_\-]+\.(html|py|js|css|txt|json|csv))', user_prompt, re.IGNORECASE)
+        filename = fn_match.group(1) if fn_match else "intercepted_code.txt"
         print(f"[Interceptor] Caught raw code block. Saving to {filename}")
         return [{"function": {"name": "write_file", "arguments": {"filename": filename, "content": code}}}]
 
@@ -251,9 +249,14 @@ def execute_tool(name: str, args: dict) -> str:
             dst = safe_resolve(args["destination"])
             overwrite = bool(args.get("overwrite", False))
             if not src.exists(): return f"ERROR: source not found: {src}"
+            
+            # FIX: If destination is an existing directory, move the file INTO it.
+            if dst.is_dir():
+                dst = dst / src.name
+                
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.exists():
-                if not overwrite: return f"ERROR: destination exists: {dst}"
+                if not overwrite: return f"ERROR: destination file already exists: {dst}"
                 if dst.is_dir(): shutil.rmtree(dst)
                 else: dst.unlink()
             shutil.move(str(src), str(dst))
@@ -263,6 +266,11 @@ def execute_tool(name: str, args: dict) -> str:
             src = safe_resolve(args["source"])
             dst = safe_resolve(args["destination"])
             if not src.exists(): return f"ERROR: source not found: {src}"
+            
+            # FIX: If destination is an existing directory, copy the file INTO it.
+            if dst.is_dir():
+                dst = dst / src.name
+                
             dst.parent.mkdir(parents=True, exist_ok=True)
             if src.is_dir(): shutil.copytree(src, dst, dirs_exist_ok=True)
             else: shutil.copy2(src, dst)
